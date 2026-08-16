@@ -1,0 +1,3 @@
+lc7001>=1.0.5
+httpx>=0.24
+cryptography>=41

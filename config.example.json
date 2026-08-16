@@ -1,0 +1,53 @@
+{
+  "lc7001": {
+    "host": "192.168.1.50",
+    "password": "your-legrand-app-password-or-empty"
+  },
+  "hue": {
+    "ip": "192.168.1.60",
+    "app_key": "written-here-by-the-setup-wizard"
+  },
+  "web_port": 8582,
+  "log_level": "INFO",
+  "links": [
+    {
+      "name": "Bedroom overhead",
+      "lc7001_zid": 3,
+      "hue_resource": "grouped_light",
+      "hue_id": "uuid-of-a-hue-room-or-zone",
+      "min_brightness": 5.0,
+      "max_brightness": 100.0,
+      "follow_hue": true,
+      "ramp_mode": "fade"
+    },
+    {
+      "name": "Bed lamps",
+      "lc7001_zid": 4,
+      "hue_resource": "light",
+      "hue_id": "uuid-of-a-single-bulb",
+      "min_brightness": 1.0,
+      "max_brightness": 80.0,
+      "follow_hue": false,
+      "ramp_mode": "steady",
+      "throttle": 0.12,
+      "transition_ms": 400
+    }
+  ],
+  "scenes": [
+    {
+      "name": "Sunroom on",
+      "lc7001_sid": 5,
+      "hue_resource": "grouped_light",
+      "hue_id": "uuid-of-a-hue-room-or-zone",
+      "on": true,
+      "brightness": 60
+    },
+    {
+      "name": "Sunroom off",
+      "lc7001_sid": 6,
+      "hue_resource": "grouped_light",
+      "hue_id": "uuid-of-a-hue-room-or-zone",
+      "on": false
+    }
+  ]
+}

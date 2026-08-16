@@ -1,0 +1,9 @@
+# Your credentials and mappings. Contains the LC7001 password and the Hue
+# application key -- never commit this. config.example.json is the template.
+config.json
+
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
