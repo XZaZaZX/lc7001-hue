@@ -72,7 +72,10 @@ LEVEL_TOLERANCE = 1  # LC7001 steps we treat as "same" when Hue reports back
 # handles a double tap in its own firmware -- it goes to full brightness and
 # reports a single "on at 100" to the hub, so the second press never reaches us.
 # An off and an on arrive as two separate messages, which is unambiguous.
-DEFAULT_FLICK_SECONDS = 1.5
+# The window is generous because an RFLC paddle needs roughly a second of press
+# before it registers at all -- two deliberate presses land 3-5 seconds apart,
+# not under one. Tune per dimmer with flick_seconds in config.json.
+DEFAULT_FLICK_SECONDS = 5.0
 # A Hue scene sets every bulb in the room differently, so while it lands the
 # bridge reports the group's aggregate brightness several times in a row. Those
 # are not commands -- writing each one back to the wall dimmer, and then pushing
@@ -818,6 +821,24 @@ class Bridge:
     async def _scene_sync(self, link: Link) -> None:
         try:
             await asyncio.sleep(SCENE_SETTLE_SECONDS + 0.2)
+            # Read where the room actually ended up rather than trusting the
+            # paddle's remembered level. After a flick that level is whatever
+            # the wall dimmer last held -- frequently 100 -- and leaving it
+            # there means the next push repaints the scene at full brightness.
+            try:
+                groups = await self.hue.get(f"{link.hue_resource}/{link.hue_id}")
+            except Exception:  # noqa: BLE001
+                groups = []
+            if groups:
+                dimming = groups[0].get("dimming") or {}
+                brightness = dimming.get("brightness")
+                if brightness is not None:
+                    link.desired["level"] = link.unscale(float(brightness))
+                on_state = (groups[0].get("on") or {}).get("on")
+                if on_state is not None:
+                    link.desired["on"] = bool(on_state)
+                link.last_sent = self._current_snapshot(link)
+
             if not link.follow_hue:
                 return
             level = link.desired.get("level")

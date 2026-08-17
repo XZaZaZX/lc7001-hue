@@ -25,6 +25,8 @@ from lc7001_hue import Bridge, Config, Link, SceneLink
 # --------------------------------------------------------------------------
 
 HUE_PUTS: list[tuple[str, dict]] = []
+# What the fake bridge reports as the group's current brightness.
+GROUP_BRIGHTNESS = [100.0]
 HUE_EVENTS: "asyncio.Queue[str]" = asyncio.Queue()
 _events_thread_queue: list[str] = []
 _events_lock = threading.Lock()
@@ -69,7 +71,11 @@ class FakeHue(BaseHTTPRequestHandler):
         elif self.path.endswith("/light"):
             self._json({"errors": [], "data": [{"id": "light-1"}]})
         elif "/grouped_light/" in self.path:
-            self._json({"errors": [], "data": [{"owner": {"rid": "room-1"}}]})
+            self._json({"errors": [], "data": [{
+                "owner": {"rid": "room-1"},
+                "on": {"on": True},
+                "dimming": {"brightness": GROUP_BRIGHTNESS[0]},
+            }]})
         elif self.path.endswith("/scene"):
             self._json({"errors": [], "data": [
                 {"id": "scene-a", "group": {"rid": "room-1"},
@@ -554,8 +560,9 @@ async def main() -> int:
 
     # Off, wait, on -- ordinary use, must NOT be read as a gesture.
     HUE_PUTS.clear()
+    link0.flick_seconds = 1.5      # keep this section quick; the default is 5s
     hub.wall_change(3, Power=False)
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(2.5)
     hub.wall_change(3, Power=True, PowerLevel=50)
     await asyncio.sleep(1.2)
     check("a slow off-then-on is left alone",
@@ -581,6 +588,7 @@ async def main() -> int:
         push_hue_event([{"type": "update", "data": [payload]}])
 
     hub.echo_writes = True          # model the real hub echoing our own writes
+    await asyncio.sleep(5.0)        # let the previous section's scene syncs land
     # Straight from a real log: after a recall the bridge reports the group's
     # brightness several times as the individual bulbs arrive (51, 54, 70, 39).
     # Writing each to the wall, then pushing the wall's echo back to Hue as one
@@ -610,10 +618,16 @@ async def main() -> int:
           100.0 not in [b["dimming"]["brightness"] for b in writes], str(writes))
 
     # The wall dimmer still ends up in step once everything has settled.
+    GROUP_BRIGHTNESS[0] = 39.0
     await asyncio.sleep(4.0)
     check("the wall dimmer is synced to where the scene landed",
           hub.last_set_level(3) == link0.unscale(39.0),
           f"wall={hub.last_set_level(3)} want={link0.unscale(39.0)}")
+    # And the service's own idea of the level must match the scene, or the next
+    # push repaints the room at the paddle's remembered brightness.
+    check("the link adopts the scene's brightness, not the paddle's",
+          link0.desired.get("level") == link0.unscale(39.0),
+          f"desired={link0.desired.get('level')} want={link0.unscale(39.0)}")
 
     # And an off during all this is still obeyed instantly -- a settling scene
     # must never make the switch feel dead.
