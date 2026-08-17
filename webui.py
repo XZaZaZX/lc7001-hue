@@ -209,6 +209,9 @@ PAGE = """<!DOCTYPE html>
   #log .t { color: var(--dim); }
   .empty { color: var(--dim); font-size: 13px; padding: 14px 0; }
   .saved { color: var(--good); font-size: 13px; }
+  .saved.warn { color: #ffb454; }
+  tr.bad td { background: #2b1512; }
+  tr.bad select { border-color: var(--bad); }
 
   /* Phones and small tablets: a table with eight columns is unreadable at
      360px, so each row becomes a labelled card instead. Same markup, same
@@ -360,17 +363,17 @@ function renderLinks() {
   const tb = document.getElementById('links');
   tb.innerHTML = links.map((l, i) => `
     <tr>
-      <td data-label="Name"><input type="text" value="${esc(l.name)}" oninput="links[${i}].name=this.value"></td>
-      <td data-label="Dimmer"><select onchange="links[${i}].lc7001_zid=+this.value||null">${zoneOptions(l.lc7001_zid)}</select></td>
-      <td data-label="Hue target"><select onchange="setHue(links,${i},this.value)">${
+      <td data-label="Name"><input type="text" data-f="name" autocomplete="off" value="${esc(l.name)}" oninput="links[${i}].name=this.value"></td>
+      <td data-label="Dimmer"><select data-f="zid" onchange="links[${i}].lc7001_zid=pickId(this.value)">${zoneOptions(l.lc7001_zid)}</select></td>
+      <td data-label="Hue target"><select data-f="hue" onchange="setHue(links,${i},this.value)">${
         hueOptions(l.hue_resource && l.hue_id ? l.hue_resource + '|' + l.hue_id : '')}</select></td>
-      <td data-label="Min %"><input type="number" min="1" max="100" value="${l.min_brightness ?? 1
+      <td data-label="Min %"><input type="number" data-f="min" autocomplete="off" min="1" max="100" value="${l.min_brightness ?? 1
         }" oninput="links[${i}].min_brightness=+this.value"></td>
-      <td data-label="Max %"><input type="number" min="1" max="100" value="${l.max_brightness ?? 100
+      <td data-label="Max %"><input type="number" data-f="max" autocomplete="off" min="1" max="100" value="${l.max_brightness ?? 100
         }" oninput="links[${i}].max_brightness=+this.value"></td>
-      <td data-label="Follow Hue"><input type="checkbox" ${l.follow_hue !== false ? 'checked' : ''
+      <td data-label="Follow Hue"><input type="checkbox" data-f="follow" ${l.follow_hue !== false ? 'checked' : ''
         } onchange="links[${i}].follow_hue=this.checked"></td>
-      <td data-label="Paddle hold"><select onchange="links[${i}].ramp_mode=this.value" title="How to handle the LC7001 announcing where a ramp is headed before it reports where the paddle actually stopped">
+      <td data-label="Paddle hold"><select data-f="ramp" onchange="links[${i}].ramp_mode=this.value" title="How to handle the LC7001 announcing where a ramp is headed before it reports where the paddle actually stopped">
         ${RAMP_MODES.map(m => `<option value="${m.id}"${
           (l.ramp_mode || 'fade') === m.id ? ' selected' : ''}>${m.label}</option>`).join('')}
       </select></td>
@@ -387,15 +390,15 @@ function renderScenes() {
   const tb = document.getElementById('scenes');
   tb.innerHTML = scenes.map((s, i) => `
     <tr>
-      <td data-label="Name"><input type="text" value="${esc(s.name)}" oninput="scenes[${i}].name=this.value"></td>
-      <td data-label="Scene"><select onchange="scenes[${i}].lc7001_sid=+this.value||null">${sceneOptions(s.lc7001_sid)}</select></td>
-      <td data-label="Hue target"><select onchange="setHue(scenes,${i},this.value)">${
+      <td data-label="Name"><input type="text" data-f="name" autocomplete="off" value="${esc(s.name)}" oninput="scenes[${i}].name=this.value"></td>
+      <td data-label="Scene"><select data-f="sid" onchange="scenes[${i}].lc7001_sid=pickId(this.value)">${sceneOptions(s.lc7001_sid)}</select></td>
+      <td data-label="Hue target"><select data-f="hue" onchange="setHue(scenes,${i},this.value)">${
         hueOptions(s.hue_resource && s.hue_id ? s.hue_resource + '|' + s.hue_id : '')}</select></td>
-      <td data-label="Action"><select onchange="scenes[${i}].on=this.value==='on'">
+      <td data-label="Action"><select data-f="act" onchange="scenes[${i}].on=this.value==='on'">
         <option value="on"${s.on !== false ? ' selected' : ''}>turn on</option>
         <option value="off"${s.on === false ? ' selected' : ''}>turn off</option>
       </select></td>
-      <td data-label="Bright %"><input type="number" min="1" max="100" value="${s.brightness ?? 60
+      <td data-label="Bright %"><input type="number" data-f="bright" autocomplete="off" min="1" max="100" value="${s.brightness ?? 60
         }" oninput="scenes[${i}].brightness=+this.value"></td>
       <td data-label="" class="row-actions">
         <button class="link" onclick="identify(scenes[${i}])" title="Flash this Hue target">flash</button>
@@ -404,6 +407,13 @@ function renderScenes() {
     </tr>`).join('');
   document.getElementById('scenes-empty').hidden = scenes.length > 0;
 }
+
+// "" means nothing picked. Everything else is a real id -- and ZID 0 / SID 0
+// are real ids, so this must not treat a numeric zero as "unset".
+function pickId(value) {
+  return value === '' ? null : +value;
+}
+const isPicked = v => v !== null && v !== undefined && v !== '';
 
 function setHue(list, i, value) {
   const [resource, id] = (value || '|').split('|');
@@ -426,14 +436,81 @@ async function identify(row) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ resource: row.hue_resource, id: row.hue_id }) });
 }
+// Read the rows back out of the DOM instead of trusting the model the
+// oninput/onchange handlers built. Chrome restores form-control values across a
+// reload without firing any event, so after a refresh a row can LOOK filled in
+// while the JS behind it is still the blank row that was rendered -- which is
+// exactly how a mapping gets silently dropped on save. The DOM is what the user
+// sees, so the DOM wins.
+function harvest() {
+  const val = (tr, f) => {
+    const el = tr.querySelector('[data-f="' + f + '"]');
+    return el ? (el.type === 'checkbox' ? el.checked : el.value) : '';
+  };
+  const hue = (row, v) => {
+    const [resource, id] = (v || '|').split('|');
+    row.hue_resource = resource; row.hue_id = id;
+    return row;
+  };
+  links = Array.from(document.getElementById('links').children).map((tr, i) => hue({
+    ...(links[i] || {}),
+    name: val(tr, 'name'),
+    lc7001_zid: pickId(val(tr, 'zid')),
+    min_brightness: +val(tr, 'min'),
+    max_brightness: +val(tr, 'max'),
+    follow_hue: val(tr, 'follow'),
+    ramp_mode: val(tr, 'ramp'),
+  }, val(tr, 'hue')));
+  scenes = Array.from(document.getElementById('scenes').children).map((tr, i) => hue({
+    ...(scenes[i] || {}),
+    name: val(tr, 'name'),
+    lc7001_sid: pickId(val(tr, 'sid')),
+    on: val(tr, 'act') === 'on',
+    brightness: +val(tr, 'bright'),
+  }, val(tr, 'hue')));
+}
+
 async function save() {
   const note = document.getElementById('saved');
-  const clean = r => r.lc7001_zid || r.lc7001_sid;
+  harvest();
+  const goodLink  = r => isPicked(r.lc7001_zid) && isPicked(r.hue_id);
+  const goodScene = r => isPicked(r.lc7001_sid) && isPicked(r.hue_id);
+  const keptLinks = links.filter(goodLink);
+  const keptScenes = scenes.filter(goodScene);
+
+  // Point at the row. "1 row was skipped" with four rows on screen tells you
+  // nothing -- highlight the offender and say which field is missing.
+  const bad = [];
+  const flag = (tbodyId, list, good, zidKey, what) => {
+    const rows = document.getElementById(tbodyId).children;
+    list.forEach((r, i) => {
+      const tr = rows[i];
+      if (tr) tr.classList.toggle('bad', !good(r));
+      if (good(r)) return;
+      const missing = [];
+      if (!isPicked(r[zidKey])) missing.push(what);
+      if (!isPicked(r.hue_id)) missing.push('a Hue target');
+      bad.push('"' + (r.name || 'unnamed') + '" needs ' + missing.join(' and '));
+    });
+  };
+  flag('links', links, goodLink, 'lc7001_zid', 'a Legrand dimmer');
+  flag('scenes', scenes, goodScene, 'lc7001_sid', 'a scene');
+
   const res = await fetch('/api/config', { method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ links: links.filter(clean), scenes: scenes.filter(clean) }) });
-  note.textContent = res.ok ? 'Saved and applied.' : 'Save failed.';
-  setTimeout(() => note.textContent = '', 4000);
+    body: JSON.stringify({ links: keptLinks, scenes: keptScenes }) });
+
+  // Say so out loud. Silently discarding a half-filled row is how you end up
+  // convinced you saved a mapping that was never there.
+  if (!res.ok) {
+    note.className = 'saved warn'; note.textContent = 'Save failed.';
+  } else if (bad.length) {
+    note.className = 'saved warn';
+    note.textContent = 'Saved, but not ' + bad.join('; ') + '.';
+  } else {
+    note.className = 'saved'; note.textContent = 'Saved and applied.';
+  }
+  setTimeout(() => { note.textContent = ''; note.className = 'saved'; }, 12000);
 }
 
 function pill(id, up) {
