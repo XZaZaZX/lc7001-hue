@@ -159,5 +159,3 @@ remap through the web API.
 ## License
 
 MIT.
-
-Built with [Claude](https://claude.com/claude-code).
