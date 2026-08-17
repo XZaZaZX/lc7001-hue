@@ -73,6 +73,14 @@ LEVEL_TOLERANCE = 1  # LC7001 steps we treat as "same" when Hue reports back
 # reports a single "on at 100" to the hub, so the second press never reaches us.
 # An off and an on arrive as two separate messages, which is unambiguous.
 DEFAULT_FLICK_SECONDS = 1.5
+# A Hue scene sets every bulb in the room differently, so while it lands the
+# bridge reports the group's aggregate brightness several times in a row. Those
+# are not commands -- writing each one back to the wall dimmer, and then pushing
+# the wall's echo back to Hue as one uniform brightness, flattens the scene and
+# runs away. Both directions stand still until the scene has settled.
+SCENE_SETTLE_SECONDS = 4.0
+# How long a level we wrote to the wall stays recognisable as our own echo.
+WALL_ECHO_SECONDS = 4.0
 
 
 # --------------------------------------------------------------------------
@@ -110,6 +118,34 @@ class Link:
     scene_list: list[dict[str, str]] = field(default_factory=list, repr=False)
     scene_index: int = field(default=-1, repr=False)
     skip_push: bool = field(default=False, repr=False)
+    scene_until: float = field(default=0.0, repr=False)
+    wall_writes: list = field(default_factory=list, repr=False)
+
+    def note_wall_write(self, now: float, level: "int | None") -> None:
+        """Remember a level we sent to the wall, so its echo is recognisable."""
+        self.wall_writes = [
+            (at, lv) for at, lv in self.wall_writes if now - at < WALL_ECHO_SECONDS
+        ]
+        if level is not None:
+            self.wall_writes.append((now, int(level)))
+
+    def is_wall_echo(self, now: float, level: "int | None") -> bool:
+        """Is this report just the hub repeating a level we set ourselves?
+
+        Several follow-Hue writes can land within milliseconds of each other, so
+        comparing against only the most recent one is not enough -- the hub
+        echoes them back in order and the earlier ones look like paddle presses.
+        """
+        if level is None:
+            return False
+        return any(
+            now - at < WALL_ECHO_SECONDS and abs(int(level) - lv) <= LEVEL_TOLERANCE
+            for at, lv in self.wall_writes
+        )
+
+    def settling(self, now: float) -> bool:
+        """Is a scene still landing on this link's lights?"""
+        return now < self.scene_until
 
     def is_flick(self, now: float) -> bool:
         """Did this switch go off and back on quickly enough to mean 'next scene'?"""
@@ -354,6 +390,7 @@ class Bridge:
         self.links = config.links
         self._by_zid: dict[int, Link] = {}
         self._by_hue: dict[tuple[str, str], Link] = {}
+        self._scene_syncs: dict[int, Any] = {}
         self._index_links()
         self.hue = HueBridge(
             config.hue_ip, config.hue_app_key, scheme=config.hue_scheme
@@ -609,11 +646,25 @@ class Bridge:
         # to the LC7001 ourselves we also record the values in link.desired, so
         # the hub's echo compares equal below and changes nothing. A genuine
         # paddle press always differs, and is never swallowed.
+        now = time.monotonic()
+        incoming_level = (
+            int(properties[lc7001.aio.Composer.POWER_LEVEL])
+            if lc7001.aio.Composer.POWER_LEVEL in properties
+            else None
+        )
+        # Our own follow-Hue writes come straight back from the hub. Several can
+        # be in flight at once, so match against every recent one, not just the
+        # last -- otherwise the earlier echoes read as paddle presses and get
+        # pushed back to Hue, which is how a scene recall used to run away.
+        echo = link.is_wall_echo(now, incoming_level)
+
         changed = False
         flicked = False
+        power_changed = False
         if lc7001.aio.Composer.POWER in properties:
             power = bool(properties[lc7001.aio.Composer.POWER])
             if link.desired.get("on") != power:
+                power_changed = True
                 was_on = link.desired.get("on")
                 link.desired["on"] = power
                 changed = True
@@ -635,6 +686,13 @@ class Bridge:
             link.last_off_at = 0.0
             link.skip_push = True
             await self.cycle_scene(link)
+            return
+
+        # Hold still for brightness noise while a scene lands -- but never for a
+        # power change. Flipping the switch off has to work at any moment, scene
+        # or no scene, so only level-only reports are absorbed here.
+        if changed and not power_changed and (echo or link.settling(now)):
+            link.last_sent = self._current_snapshot(link)
             return
 
         if changed:
@@ -727,6 +785,12 @@ class Bridge:
                     link.name,
                 )
                 return
+            link.scene_until = time.monotonic() + SCENE_SETTLE_SECONDS
+            # We are deliberately handing this room over to the scene, so the
+            # bridge's reports about it are news, not our own echo. Drop the
+            # suppression window or the settled brightness may never land and
+            # the wall dimmer gets synced to a stale level.
+            link.last_write_to_hue = 0.0
             link.scene_index = (link.scene_index + 1) % len(link.scene_list)
             scene = link.scene_list[link.scene_index]
             _log.info(
@@ -738,10 +802,36 @@ class Bridge:
             )
             self.log_event("flick", link.zid, {"scene": scene["name"]})
             await recall_scene(self.hue, scene["id"])
+            self._schedule_scene_sync(link)
         except HueError as error:
             _log.warning("[%s] could not recall a scene: %s", link.name, error)
         except Exception:  # noqa: BLE001
             _log.exception("[%s] scene cycling failed", link.name)
+
+    def _schedule_scene_sync(self, link: Link) -> None:
+        """After a scene settles, put the wall dimmer where the room ended up."""
+        existing = self._scene_syncs.get(link.zid)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        self._scene_syncs[link.zid] = asyncio.ensure_future(self._scene_sync(link))
+
+    async def _scene_sync(self, link: Link) -> None:
+        try:
+            await asyncio.sleep(SCENE_SETTLE_SECONDS + 0.2)
+            if not link.follow_hue:
+                return
+            level = link.desired.get("level")
+            on = bool(link.desired.get("on"))
+            _log.info(
+                "[%s] scene settled -> wall switch power=%s level=%s",
+                link.name, on, level,
+            )
+            link.note_wall_write(time.monotonic(), level if on else None)
+            await self.hub.apply_zone(link.zid, on, level if on else None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _log.exception("[%s] could not sync the wall dimmer after a scene", link.name)
 
     # ---- LC7001 scenes (scene-controller buttons) -> Hue -----------------
 
@@ -821,7 +911,16 @@ class Bridge:
         link.desired["on"] = power
         link.desired["level"] = level
         link.last_sent = {"on": bool(power), "level": level if power else None}
+
+        # While a scene is landing the bridge reports the group's brightness
+        # several times as the individual bulbs arrive. Chasing each one drags
+        # the wall dimmer around and feeds the loop; one write at the end is
+        # what actually keeps the paddle honest.
+        if link.settling(time.monotonic()):
+            return
+
         _log.info("[%s] hue -> wall switch power=%s level=%s", link.name, power, level)
+        link.note_wall_write(time.monotonic(), level if power else None)
         await self.hub.apply_zone(link.zid, bool(power), level if power else None)
 
     # ---- lifecycle -------------------------------------------------------
@@ -1074,7 +1173,11 @@ def main() -> int:
     logging.getLogger("lc7001.aio").setLevel(
         logging.DEBUG if args.verbose else logging.WARNING
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # httpcore logs every header of every request at DEBUG, which buries the
+    # service's own lines completely -- and DEBUG is exactly when you need to
+    # read them.
+    for noisy in ("httpx", "httpcore", "httpcore.http11", "httpcore.connection"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if args.listen is not None:
         return asyncio.run(listen(config, args.listen))

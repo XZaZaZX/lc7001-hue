@@ -12,6 +12,7 @@ import json
 import pathlib
 import tempfile
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -107,6 +108,8 @@ class FakeLC7001:
         self.writer: asyncio.StreamWriter | None = None
         self.sets: list[dict] = []
         self.port = 0
+        # The real hub echoes every write back as a ZonePropertiesChanged.
+        self.echo_writes = False
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -183,7 +186,19 @@ class FakeLC7001:
                         "Status": "Success",
                     }
                 )
+                if self.echo_writes:
+                    self.wall_change(zid, **message.get("PropertyList", {}))
             await writer.drain()
+
+    def last_set_level(self, zid: int) -> "int | None":
+        """The PowerLevel of the most recent write this hub received."""
+        for message in reversed(self.sets):
+            if message.get("ZID") != zid:
+                continue
+            level = (message.get("PropertyList") or {}).get("PowerLevel")
+            if level is not None:
+                return int(level)
+        return None
 
     def press_scene_button(self, sid: int) -> None:
         """Simulate a scene-controller button press."""
@@ -559,6 +574,70 @@ async def main() -> int:
           not [b for _p, b in HUE_PUTS if "recall" in b], str(HUE_PUTS)[:300])
     link0.scene_list = []
     link0.scene_index = -1
+
+    print("\n9f. a scene is not flattened by Follow Hue chasing it")
+
+    def hue_event(payload: dict) -> None:
+        push_hue_event([{"type": "update", "data": [payload]}])
+
+    hub.echo_writes = True          # model the real hub echoing our own writes
+    # Straight from a real log: after a recall the bridge reports the group's
+    # brightness several times as the individual bulbs arrive (51, 54, 70, 39).
+    # Writing each to the wall, then pushing the wall's echo back to Hue as one
+    # uniform brightness, used to flatten the scene and saturate it at 100%.
+    link0.scene_cycle = True
+    link0.last_off_at = 0.0
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(1.2)
+
+    HUE_PUTS.clear()
+    hub.wall_change(3, Power=False)
+    await asyncio.sleep(0.4)
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(0.8)
+
+    # The bulbs arrive one by one; the group's aggregate is reported each time.
+    for brightness in (51.0, 54.0, 70.0, 39.0):
+        hue_event({"type": "grouped_light", "id": "group-abc",
+                   "on": {"on": True}, "dimming": {"brightness": brightness}})
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(1.5)
+
+    writes = [b for _p, b in HUE_PUTS if "dimming" in b]
+    check("the settling scene is never written back to Hue", not writes,
+          str(HUE_PUTS)[:400])
+    check("and it never saturates at full",
+          100.0 not in [b["dimming"]["brightness"] for b in writes], str(writes))
+
+    # The wall dimmer still ends up in step once everything has settled.
+    await asyncio.sleep(4.0)
+    check("the wall dimmer is synced to where the scene landed",
+          hub.last_set_level(3) == link0.unscale(39.0),
+          f"wall={hub.last_set_level(3)} want={link0.unscale(39.0)}")
+
+    # And an off during all this is still obeyed instantly -- a settling scene
+    # must never make the switch feel dead.
+    HUE_PUTS.clear()
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(0.4)
+    hub.wall_change(3, Power=False)
+    await asyncio.sleep(0.4)
+    link0.scene_until = time.monotonic() + 5.0     # pretend a scene is landing
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(0.4)
+    HUE_PUTS.clear()
+    hub.wall_change(3, Power=False)
+    await asyncio.sleep(1.5)
+    check("turning the switch off mid-scene still reaches the lights",
+          [b for _p, b in HUE_PUTS if b.get("on", {}).get("on") is False],
+          str(HUE_PUTS)[:300])
+
+    hub.echo_writes = False
+    link0.scene_cycle = False
+    link0.scene_until = 0.0
+    link0.scene_list = []
+    link0.scene_index = -1
+    link0.wall_writes = []
 
     print("\n9d. UI save keeps hand-tuned fields it doesn't display")
     import json as _json
