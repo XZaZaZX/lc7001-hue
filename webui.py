@@ -270,6 +270,7 @@ PAGE = """<!DOCTYPE html>
 <section>
   <h2>Dimmers</h2>
   <p class="hint">Each row points one Legrand wall dimmer at one Hue room, zone, or bulb. Pick a Hue <em>zone</em> when you want a couple of bulbs to move together.</p>
+  <p class="hint"><b>Scenes</b>: flick the switch off and straight back on (within about a second) to step to the next Hue scene in that room. A double tap can't be used &mdash; the Legrand paddle handles that itself, jumping to full brightness and reporting a single press, so the second tap never reaches the hub. Only works on a Hue room or zone; single bulbs have no scenes.</p>
   <p class="hint"><b>Paddle hold</b> decides what happens when you press and hold. The LC7001 doesn&rsquo;t report a ramp as it happens &mdash; it announces the endpoint (off, or 100%) the moment you press, and only reports where the paddle really stopped a few seconds later. <b>Snappy</b>: taps are instant, holding visibly bounces first. <b>Soft fade</b>: acts at once but eases in, so the bounce becomes a swell. <b>No bounce</b>: waits for confirmation &mdash; clean holds, but a tap takes a couple of seconds to act. Change it, save, and try it at the wall.</p>
   <table>
     <thead>
@@ -280,6 +281,7 @@ PAGE = """<!DOCTYPE html>
         <th style="width:7%">Min %</th>
         <th style="width:7%">Max %</th>
         <th style="width:8%">Follow Hue</th>
+        <th style="width:8%">Scenes</th>
         <th style="width:13%">Paddle hold</th>
         <th style="width:7%">Now</th>
         <th></th>
@@ -373,6 +375,8 @@ function renderLinks() {
         }" oninput="links[${i}].max_brightness=+this.value"></td>
       <td data-label="Follow Hue"><input type="checkbox" data-f="follow" ${l.follow_hue !== false ? 'checked' : ''
         } onchange="links[${i}].follow_hue=this.checked"></td>
+      <td data-label="Scenes"><input type="checkbox" data-f="cycle" ${l.scene_cycle ? 'checked' : ''
+        } onchange="links[${i}].scene_cycle=this.checked" title="Flick the switch off and straight back on to step to the next Hue scene in this room"></td>
       <td data-label="Paddle hold"><select data-f="ramp" onchange="links[${i}].ramp_mode=this.value" title="How to handle the LC7001 announcing where a ramp is headed before it reports where the paddle actually stopped">
         ${RAMP_MODES.map(m => `<option value="${m.id}"${
           (l.ramp_mode || 'fade') === m.id ? ' selected' : ''}>${m.label}</option>`).join('')}
@@ -422,7 +426,7 @@ function setHue(list, i, value) {
 function addLink() {
   links.push({ name: 'New dimmer', lc7001_zid: null, hue_resource: '', hue_id: '',
                min_brightness: 1, max_brightness: 100, follow_hue: true,
-               ramp_mode: 'fade' });
+               scene_cycle: false, ramp_mode: 'fade' });
   renderLinks();
 }
 function addScene() {
@@ -459,6 +463,7 @@ function harvest() {
     min_brightness: +val(tr, 'min'),
     max_brightness: +val(tr, 'max'),
     follow_hue: val(tr, 'follow'),
+    scene_cycle: val(tr, 'cycle'),
     ramp_mode: val(tr, 'ramp'),
   }, val(tr, 'hue')));
   scenes = Array.from(document.getElementById('scenes').children).map((tr, i) => hue({
@@ -545,7 +550,9 @@ async function refreshEvents() {
   const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   for (const e of data.events) {
     const div = document.createElement('div');
-    div.innerHTML = `<span class="t">${esc(e.time)}</span> ` + (e.kind === 'scene'
+    div.innerHTML = `<span class="t">${esc(e.time)}</span> ` + (e.kind === 'flick'
+      ? `<span class="s">SCENE</span> ZID ${e.id} &mdash; ${esc(e.name)} &rarr; ${esc(e.detail)}`
+      : e.kind === 'scene'
       ? `<span class="s">BUTTON</span> SID ${e.id} &mdash; ${esc(e.name)}`
       : `<span class="z">DIMMER</span> ZID ${e.id} &mdash; ${esc(e.name)} ${esc(e.detail)}`);
     log.appendChild(div);

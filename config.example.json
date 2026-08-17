@@ -18,7 +18,9 @@
       "min_brightness": 5.0,
       "max_brightness": 100.0,
       "follow_hue": true,
-      "ramp_mode": "fade"
+      "ramp_mode": "fade",
+      "scene_cycle": true,
+      "flick_seconds": 1.5
     },
     {
       "name": "Bed lamps",

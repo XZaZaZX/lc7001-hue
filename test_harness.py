@@ -67,6 +67,17 @@ class FakeHue(BaseHTTPRequestHandler):
                 threading.Event().wait(0.05)
         elif self.path.endswith("/light"):
             self._json({"errors": [], "data": [{"id": "light-1"}]})
+        elif "/grouped_light/" in self.path:
+            self._json({"errors": [], "data": [{"owner": {"rid": "room-1"}}]})
+        elif self.path.endswith("/scene"):
+            self._json({"errors": [], "data": [
+                {"id": "scene-a", "group": {"rid": "room-1"},
+                 "metadata": {"name": "Relax"}},
+                {"id": "scene-b", "group": {"rid": "room-1"},
+                 "metadata": {"name": "Concentrate"}},
+                {"id": "scene-z", "group": {"rid": "other-room"},
+                 "metadata": {"name": "Somewhere else"}},
+            ]})
         else:
             self._json({"errors": [], "data": []})
 
@@ -487,6 +498,67 @@ async def main() -> int:
     offs = [b.get("dynamics", {}).get("duration") for _p, b in HUE_PUTS
             if b.get("on", {}).get("on") is False]
     check("turning off fades rather than snaps", offs and offs[-1] == 2000, str(HUE_PUTS))
+
+    print("\n9e. flicking the switch off and back on cycles Hue scenes")
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(1.2)
+    link0.scene_cycle = True          # arm it only once the zone has settled on
+    link0.scene_list = []
+    link0.scene_index = -1
+    link0.last_off_at = 0.0
+
+    # A deliberate flick: off, then straight back on inside the window.
+    HUE_PUTS.clear()
+    hub.wall_change(3, Power=False)
+    await asyncio.sleep(0.4)
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(1.2)
+    recalls = [pth for pth, b in HUE_PUTS if "recall" in b]
+    check("a flick recalls a scene", len(recalls) == 1, str(HUE_PUTS)[:300])
+    check("it recalls the room's first scene",
+          recalls and recalls[0].endswith("/scene-a"), str(recalls))
+    # The off half of the flick reaches the lights -- that really happened at the
+    # wall. What must not happen is a brightness write after the recall, undoing
+    # the scene we just set.
+    after = [b for pth, b in HUE_PUTS[[p for p, _ in HUE_PUTS].index(recalls[0]) + 1:]
+             if "dimming" in b] if recalls else []
+    check("nothing overwrites the scene afterwards", not after, str(HUE_PUTS)[:400])
+
+    # A second flick steps on, and wraps past the end of the list.
+    HUE_PUTS.clear()
+    for expected in ("/scene-b", "/scene-a"):
+        hub.wall_change(3, Power=False)
+        await asyncio.sleep(0.4)
+        hub.wall_change(3, Power=True, PowerLevel=50)
+        await asyncio.sleep(1.2)
+    recalls = [pth for pth, b in HUE_PUTS if "recall" in b]
+    check("further flicks step through and wrap around",
+          [r.rsplit("/", 1)[-1] for r in recalls] == ["scene-b", "scene-a"], str(recalls))
+    check("scenes from other rooms are not in the rotation",
+          not any("scene-z" in r for r in recalls), str(recalls))
+
+    # Off, wait, on -- ordinary use, must NOT be read as a gesture.
+    HUE_PUTS.clear()
+    hub.wall_change(3, Power=False)
+    await asyncio.sleep(2.0)
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(1.2)
+    check("a slow off-then-on is left alone",
+          not [b for _p, b in HUE_PUTS if "recall" in b], str(HUE_PUTS)[:300])
+    check("a slow off-then-on still sets brightness normally",
+          [b for _p, b in HUE_PUTS if "dimming" in b], str(HUE_PUTS)[:300])
+
+    # And with the toggle off, a flick is just a flick.
+    link0.scene_cycle = False
+    HUE_PUTS.clear()
+    hub.wall_change(3, Power=False)
+    await asyncio.sleep(0.4)
+    hub.wall_change(3, Power=True, PowerLevel=50)
+    await asyncio.sleep(1.2)
+    check("scene cycling stays off when the box is unticked",
+          not [b for _p, b in HUE_PUTS if "recall" in b], str(HUE_PUTS)[:300])
+    link0.scene_list = []
+    link0.scene_index = -1
 
     print("\n9d. UI save keeps hand-tuned fields it doesn't display")
     import json as _json

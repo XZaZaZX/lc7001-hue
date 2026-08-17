@@ -30,7 +30,7 @@ from typing import Any, Mapping
 
 import lc7001.aio
 
-from hue_client import HueBridge, HueError
+from hue_client import HueBridge, HueError, recall_scene, scenes_for_target
 
 _log = logging.getLogger("lc7001-hue")
 
@@ -67,6 +67,13 @@ DEFAULT_RAMP_MODE = "fade"
 ECHO_SUPPRESSION_SECONDS = 2.5
 LEVEL_TOLERANCE = 1  # LC7001 steps we treat as "same" when Hue reports back
 
+# Flick a dimmer off and straight back on to step to the next Hue scene in the
+# room. Off-then-on is used rather than a double tap because the Legrand paddle
+# handles a double tap in its own firmware -- it goes to full brightness and
+# reports a single "on at 100" to the hub, so the second press never reaches us.
+# An off and an on arrive as two separate messages, which is unambiguous.
+DEFAULT_FLICK_SECONDS = 1.5
+
 
 # --------------------------------------------------------------------------
 # configuration
@@ -88,6 +95,8 @@ class Link:
     follow_hue: bool = True
     ramp_mode: str = DEFAULT_RAMP_MODE
     jump_threshold: int = DEFAULT_JUMP_THRESHOLD
+    scene_cycle: bool = False
+    flick_seconds: float = DEFAULT_FLICK_SECONDS
     # left as None unless hand-tuned in config.json, in which case they win
     endpoint_hold: float | None = None
     ramp_transition_ms: int | None = None
@@ -97,6 +106,18 @@ class Link:
     last_sent: dict[str, Any] = field(default_factory=dict, repr=False)
     wake: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     last_write_to_hue: float = field(default=0.0, repr=False)
+    last_off_at: float = field(default=0.0, repr=False)
+    scene_list: list[dict[str, str]] = field(default_factory=list, repr=False)
+    scene_index: int = field(default=-1, repr=False)
+    skip_push: bool = field(default=False, repr=False)
+
+    def is_flick(self, now: float) -> bool:
+        """Did this switch go off and back on quickly enough to mean 'next scene'?"""
+        return (
+            self.scene_cycle
+            and self.last_off_at > 0.0
+            and (now - self.last_off_at) <= self.flick_seconds
+        )
 
     def _mode(self) -> tuple[float, int]:
         return RAMP_MODES.get(self.ramp_mode, RAMP_MODES[DEFAULT_RAMP_MODE])
@@ -184,6 +205,10 @@ class Config:
                     ramp_mode=str(item.get("ramp_mode", DEFAULT_RAMP_MODE)),
                     jump_threshold=int(
                         item.get("jump_threshold", DEFAULT_JUMP_THRESHOLD)
+                    ),
+                    scene_cycle=bool(item.get("scene_cycle", False)),
+                    flick_seconds=float(
+                        item.get("flick_seconds", DEFAULT_FLICK_SECONDS)
                     ),
                     endpoint_hold=(
                         float(item["endpoint_hold"])
@@ -394,6 +419,9 @@ class Bridge:
         if kind == "scene":
             name = self.scene_catalog.get(ident, "?")
             detail = ""
+        elif kind == "flick":
+            name = (self.zone_catalog.get(ident) or {}).get("Name", "?")
+            detail = str(properties.get("scene", ""))
         else:
             name = (self.zone_catalog.get(ident) or {}).get("Name", "?")
             bits = []
@@ -434,6 +462,7 @@ class Bridge:
                     "max_brightness": link.max_brightness,
                     "follow_hue": link.follow_hue,
                     "ramp_mode": link.ramp_mode,
+                    "scene_cycle": link.scene_cycle,
                     "state": {
                         "on": link.desired.get("on"),
                         "level": link.desired.get("level"),
@@ -512,7 +541,7 @@ class Bridge:
         # hand-tuning done in the file.
         keep_links = (
             "throttle", "transition_ms", "jump_threshold",
-            "endpoint_hold", "ramp_transition_ms",
+            "endpoint_hold", "ramp_transition_ms", "flick_seconds",
         )
         keep_scenes = ("transition_ms", "hue_scene_id")
 
@@ -581,16 +610,32 @@ class Bridge:
         # the hub's echo compares equal below and changes nothing. A genuine
         # paddle press always differs, and is never swallowed.
         changed = False
+        flicked = False
         if lc7001.aio.Composer.POWER in properties:
             power = bool(properties[lc7001.aio.Composer.POWER])
             if link.desired.get("on") != power:
+                was_on = link.desired.get("on")
                 link.desired["on"] = power
                 changed = True
+                if not power:
+                    link.last_off_at = time.monotonic()
+                elif was_on is False:
+                    flicked = link.is_flick(time.monotonic())
         if lc7001.aio.Composer.POWER_LEVEL in properties:
             level = int(properties[lc7001.aio.Composer.POWER_LEVEL])
             if link.desired.get("level") != level:
                 link.desired["level"] = level
                 changed = True
+
+        if flicked:
+            # Off and straight back on means "next scene", not "restore the old
+            # level". Mark the state as already delivered so the pusher doesn't
+            # race the scene recall with a brightness write; Follow Hue brings
+            # the wall dimmer back into step once the scene lands.
+            link.last_off_at = 0.0
+            link.skip_push = True
+            await self.cycle_scene(link)
+            return
 
         if changed:
             _log.info(
@@ -609,6 +654,14 @@ class Bridge:
 
             snapshot = self._current_snapshot(link)
             if snapshot == link.last_sent:
+                continue
+
+            # A scene recall is on its way for this switch. Writing a brightness
+            # now would land on top of it and undo the scene, so adopt the state
+            # as already delivered and stay out of the way.
+            if link.skip_push:
+                link.skip_push = False
+                link.last_sent = snapshot
                 continue
 
             big = link.is_big_swing(link.last_sent, snapshot["on"], snapshot["level"])
@@ -659,6 +712,36 @@ class Bridge:
     def _current_snapshot(link: Link) -> dict[str, Any]:
         on = bool(link.desired.get("on", False))
         return {"on": on, "level": link.desired.get("level") if on else None}
+
+    async def cycle_scene(self, link: Link) -> None:
+        """Step this switch's Hue room on to its next scene."""
+        try:
+            if not link.scene_list:
+                link.scene_list = await scenes_for_target(
+                    self.hue, link.hue_resource, link.hue_id
+                )
+            if not link.scene_list:
+                _log.info(
+                    "[%s] flick ignored: no Hue scenes on this target "
+                    "(scenes belong to rooms and zones, not single bulbs)",
+                    link.name,
+                )
+                return
+            link.scene_index = (link.scene_index + 1) % len(link.scene_list)
+            scene = link.scene_list[link.scene_index]
+            _log.info(
+                "[%s] flick -> scene %d/%d: %s",
+                link.name,
+                link.scene_index + 1,
+                len(link.scene_list),
+                scene["name"],
+            )
+            self.log_event("flick", link.zid, {"scene": scene["name"]})
+            await recall_scene(self.hue, scene["id"])
+        except HueError as error:
+            _log.warning("[%s] could not recall a scene: %s", link.name, error)
+        except Exception:  # noqa: BLE001
+            _log.exception("[%s] scene cycling failed", link.name)
 
     # ---- LC7001 scenes (scene-controller buttons) -> Hue -----------------
 

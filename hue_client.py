@@ -172,6 +172,43 @@ class HueBridge:
                         _log.debug("unparsable event payload: %s", raw)
 
 
+async def scenes_for_target(
+    bridge: HueBridge, resource: str, rid: str
+) -> list[dict[str, str]]:
+    """Every Hue scene belonging to the room or zone a switch points at.
+
+    Scenes are owned by a room or zone, never by a bare light, so a switch
+    mapped to a single bulb has nothing to cycle through and gets an empty list.
+    Returned in the bridge's own order, which is stable between calls.
+    """
+    if resource != "grouped_light":
+        return []
+
+    groups = await bridge.get(f"grouped_light/{rid}")
+    if not groups:
+        return []
+    owner = (groups[0].get("owner") or {}).get("rid")
+    if not owner:
+        return []
+
+    scenes = []
+    for scene in await bridge.get("scene"):
+        if (scene.get("group") or {}).get("rid") != owner:
+            continue
+        scenes.append(
+            {
+                "id": scene["id"],
+                "name": (scene.get("metadata") or {}).get("name", "(unnamed)"),
+            }
+        )
+    return scenes
+
+
+async def recall_scene(bridge: HueBridge, scene_id: str) -> None:
+    """Activate a scene."""
+    await bridge.put("scene", scene_id, {"recall": {"action": "active"}})
+
+
 async def summarize_targets(bridge: HueBridge) -> list[dict[str, str]]:
     """List the things worth pointing a wall switch at: rooms, zones, lights."""
     targets: list[dict[str, str]] = []

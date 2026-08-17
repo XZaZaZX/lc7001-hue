@@ -40,6 +40,10 @@ design:
 - **Every change is sent twice**, typically 100–300 ms apart.
 - Some dimmers also emit a momentary `Power: false` mid-sequence with `Power: true`
   following a fraction of a second later.
+- **A fast double tap never reaches the hub.** The paddle handles it internally as
+  go-to-full and sends one `Power: true, PowerLevel: 100`, identical to any other
+  turn-on at full. There is no way to tell a double tap from a single tap, which
+  is why the scene gesture is off-then-on instead.
 - The hub accepts only a **handful of simultaneous connections**. Homebridge, the Legrand
   app, and this service all consume one.
 - Auth is a challenge/response: the hub sends `Hello V1 \x00<hex challenge> <MAC>`, and
@@ -66,6 +70,14 @@ stair-stepping. **flash** blinks a target so you can confirm you picked the righ
 | **Snappy** | Taps act instantly. Holding the paddle bounces to black or full first, then settles. |
 | **Soft fade** | Acts immediately but eases in over ~2s, so the bounce becomes a swell and the correction blends into the glide. |
 | **No bounce** | Waits ~2.5s for the endpoint to be confirmed. Holds are perfectly clean; a deliberate tap takes a couple of seconds. |
+
+**Scenes** — tick this and a quick flick of the switch (off, then straight back
+on within about a second) steps to the next Hue scene in that room. A *double
+tap* can't be used for this: the Legrand paddle implements double-tap-to-full in
+its own firmware and reports a single `Power: true, PowerLevel: 100` to the hub,
+so the second press never arrives. An off and an on are two separate messages,
+which is unambiguous. Only works on a Hue room or zone — scenes belong to groups,
+not to individual bulbs. `flick_seconds` in `config.json` sets the window.
 
 **Scene-controller buttons** — map an LC7001 scene to a Hue action. The scene doesn't
 need to do anything on the Legrand side; the press itself is the signal, so a scene whose
@@ -159,3 +171,5 @@ remap through the web API.
 ## License
 
 MIT.
+
+Built with [Claude](https://claude.com/claude-code).
