@@ -44,6 +44,13 @@ design:
   go-to-full and sends one `Power: true, PowerLevel: 100`, identical to any other
   turn-on at full. There is no way to tell a double tap from a single tap, which
   is why the scene gesture is off-then-on instead.
+- **A press has to be held for around a second before the paddle registers it.**
+  Quick taps produce nothing at all -- no message reaches the hub. So two
+  deliberate presses land 3-5 seconds apart, not under one, and any gesture built
+  on "quickly" has to be generous about what that means.
+- **Some presses arrive collapsed.** On at least one of my dimmers, an off
+  followed by an on can turn up as a single `Power: true, PowerLevel: 100` with
+  no off at all. When that happens there is nothing in the stream to detect.
 - The hub accepts only a **handful of simultaneous connections**. Homebridge, the Legrand
   app, and this service all consume one.
 - Auth is a challenge/response: the hub sends `Hello V1 \x00<hex challenge> <MAC>`, and
@@ -71,13 +78,37 @@ stair-stepping. **flash** blinks a target so you can confirm you picked the righ
 | **Soft fade** | Acts immediately but eases in over ~2s, so the bounce becomes a swell and the correction blends into the glide. |
 | **No bounce** | Waits ~2.5s for the endpoint to be confirmed. Holds are perfectly clean; a deliberate tap takes a couple of seconds. |
 
-**Scenes** — tick this and a quick flick of the switch (off, then straight back
-on within about a second) steps to the next Hue scene in that room. A *double
-tap* can't be used for this: the Legrand paddle implements double-tap-to-full in
-its own firmware and reports a single `Power: true, PowerLevel: 100` to the hub,
-so the second press never arrives. An off and an on are two separate messages,
-which is unambiguous. Only works on a Hue room or zone — scenes belong to groups,
-not to individual bulbs. `flick_seconds` in `config.json` sets the window.
+**Scenes** *(experimental — see the caveat below)* — tick this and flicking the
+switch off and then back on within `flick_seconds` (default 5) steps to the next
+Hue scene in that room. Only works on a Hue room or zone; scenes belong to
+groups, not to individual bulbs.
+
+A *double tap* can't be used for this: the Legrand paddle implements
+double-tap-to-full in its own firmware and reports a single
+`Power: true, PowerLevel: 100` to the hub, so the second press never arrives. An
+off and an on are normally two separate messages, which is unambiguous — hence
+the flick.
+
+**The caveat.** How well this works depends on the individual dimmer. RFLC
+paddles need roughly a second of press before they register anything, and on at
+least one of mine an off-then-on still sometimes arrives as a single collapsed
+`on at 100` with no off in it. When the hub doesn't report two presses there is
+nothing to detect, and the flick simply won't fire. Watch **Live switch
+activity** in the web UI while you press: if you see a distinct `off` line and a
+distinct `on` line, this will work on that dimmer. If every attempt shows up as
+one line, it won't, and the setting is best left off.
+
+Two things worth knowing even if you never use it, because both were real bugs:
+
+- A scene sets every bulb differently, so while it lands the bridge reports the
+  group's aggregate brightness repeatedly. With **Follow Hue** on, writing each
+  of those to the wall dimmer and pushing the echoes back flattened the scene to
+  one uniform brightness and saturated it at 100%. Both directions now hold
+  still for `SCENE_SETTLE_SECONDS` while a scene lands, then sync once.
+- After a scene landed, the link still held the *paddle's* remembered level —
+  usually 100 — as its idea of the room, so the next update repainted everything
+  at full. It now reads the group back from the bridge and adopts what the scene
+  actually set.
 
 **Scene-controller buttons** — map an LC7001 scene to a Hue action. The scene doesn't
 need to do anything on the Legrand side; the press itself is the signal, so a scene whose
